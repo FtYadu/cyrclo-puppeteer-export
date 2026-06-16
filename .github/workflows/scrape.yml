@@ -6,7 +6,7 @@ on:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -17,13 +17,19 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Chrome dependencies
+      - name: Install system deps for Chromium
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser fonts-liberation libappindicator3-1 libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 ca-certificates fonts-liberation libappindicator1 libnss3 lsb-release xdg-utils wget
+          sudo apt-get install -y \
+            libgbm1 libnss3 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
+            libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 \
+            libcairo2 libasound2t64 fonts-liberation wget ca-certificates
 
       - name: Install Node packages
         run: npm install puppeteer axios jszip
+        env:
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: false
 
       - name: Write scraper script
         run: |
@@ -56,7 +62,7 @@ jobs:
             try {
               const r = await axios.get(url, {
                 responseType: 'arraybuffer', timeout: 20000,
-                headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0' }
+                headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0' }
               });
               return Buffer.from(r.data);
             } catch(e) { console.warn('[skip]', url, e.message); return null; }
@@ -66,19 +72,16 @@ jobs:
             const page = await browser.newPage();
             await page.setViewport({ width: 1440, height: 900 });
             await page.setRequestInterception(true);
-
             page.on('request', req => {
               const t = req.resourceType();
               if (['image','media','font','stylesheet','script','document'].includes(t))
                 assets.set(req.url().split('?')[0], null);
               req.continue();
             });
-
             console.log('[NAV]', url);
             await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
             console.log('[IDLE] networkidle0 reached - Webflow/GSAP fully loaded');
             await sleep(3000);
-
             const links = await page.evaluate(origin =>
               Array.from(document.querySelectorAll('a[href]'))
                 .map(a => a.href)
@@ -87,29 +90,23 @@ jobs:
             );
             links.forEach(l => pageLinks.add(l.split('?')[0]));
             console.log('[LINKS] Found', links.length, 'internal links');
-
             const html = await page.content();
             await page.close();
             return html;
           }
 
           async function main() {
-            const chromePath = process.env.CHROME_PATH || '/usr/bin/chromium-browser';
-            console.log('Launching Puppeteer with Chrome at:', chromePath);
-
+            console.log('Launching Puppeteer (headless, bundled Chrome)...');
             const browser = await puppeteer.launch({
               headless: 'new',
-              executablePath: chromePath,
               args: [
                 '--no-sandbox', '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage', '--disable-gpu',
                 '--no-first-run', '--no-zygote'
               ]
             });
-
             const pageData = new Map();
             pageData.set(TARGET, await scrapePage(browser, TARGET));
-
             for (const link of pageLinks) {
               if (link === TARGET || link === TARGET.slice(0,-1)) continue;
               try {
@@ -117,39 +114,30 @@ jobs:
                 pageData.set(link, await scrapePage(browser, link));
               } catch(e) { console.warn('[fail]', link, e.message); }
             }
-
             await browser.close();
             console.log('[DONE] Browser closed | Pages:', pageData.size, '| Assets:', assets.size);
-
             let n = 0;
             for (const [u] of assets) {
               const b = await dlAsset(u);
               if (b) { assets.set(u, b); n++; }
               if (n % 10 === 0 && n > 0) console.log(' [DL]', n, '/', assets.size);
             }
-            console.log('[DL] Total fetched:', n);
-
+            console.log('[DL] Total:', n);
             const zip = new JSZip();
-            for (const [u, h] of pageData) { zip.file(filePath(u), h); console.log('[ZIP] html:', filePath(u)); }
+            for (const [u, h] of pageData) { zip.file(filePath(u), h); console.log('[ZIP]', filePath(u)); }
             for (const [u, b] of assets) { if (b) zip.file(filePath(u), b); }
-
             const buf = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
             fs.writeFileSync(ZIP, buf);
-            const mb = (buf.length/1024/1024).toFixed(2);
             console.log('\n=== SUCCESS ===');
-            console.log('ZIP:', ZIP, mb + 'MB');
-            console.log('Pages:', pageData.size);
-            console.log('Assets:', n);
-            console.log('Files in ZIP:', Object.keys(zip.files).length);
+            console.log('ZIP:', ZIP, (buf.length/1024/1024).toFixed(2)+'MB');
+            console.log('Pages:', pageData.size, '| Assets:', n, '| Files:', Object.keys(zip.files).length);
           }
 
-          main().catch(e => { console.error('[ERROR]', e); process.exit(1); });
+          main().catch(e => { console.error('[ERROR]', e.message); process.exit(1); });
           SCRIPTEOF
 
       - name: Run Puppeteer scraper
         run: node scraper.js
-        env:
-          CHROME_PATH: /usr/bin/chromium-browser
 
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
